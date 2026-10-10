@@ -440,11 +440,30 @@ fn single_instruction_helper_fn(
 
     let info = extract_ix_discriminator_info(instruction, &args_ident, has_args, &ix_mod)?;
 
+    let fixed_keys: Vec<Option<TokenStream>> = instruction
+        .accounts
+        .iter()
+        .map(|account| {
+            if account.is_optional.unwrap_or(false) {
+                return None;
+            }
+
+            let Some(codama_nodes::InstructionInputValueNode::PublicKeyValue(fixed)) =
+                (*account.default_value).as_ref()
+            else {
+                return None;
+            };
+
+            Some(crate::render::program_pubkey(&fixed.public_key))
+        })
+        .collect();
+
     let accounts_fields = instruction
         .accounts
         .iter()
+        .zip(&fixed_keys)
         .enumerate()
-        .map(|(idx, account)| {
+        .map(|(idx, (account, fixed))| {
             let field_name = format_ident!("{}", crate::utils::to_snake_case(&account.name));
             let at = crate::utils::unsuffixed(idx as u64);
 
@@ -461,11 +480,79 @@ fn single_instruction_helper_fn(
             } else {
                 let error_msg = format!("Account does not exist at index {idx}");
 
-                quote! { #field_name: *accounts.get(#at).ok_or(ParseError::from(#error_msg))? }
+                // Deployed programs accept an instruction that leaves off a fixed-address
+                // account, so use that address rather than fail the instruction.
+                let Some(fixed) = fixed else {
+                    return quote! { #field_name: *accounts.get(#at).ok_or(ParseError::from(#error_msg))? };
+                };
+
+                quote! {
+                    #field_name: accounts
+                        .get(#at)
+                        .copied()
+                        .unwrap_or(::shipstern_core::Pubkey::new(#fixed))
+                }
             }
         });
 
     let num_defined_accounts = crate::utils::unsuffixed(instruction.accounts.len() as u64);
+
+    let fixed_accounts = fixed_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, fixed)| {
+            let fixed = fixed.as_ref()?;
+            let at = crate::utils::unsuffixed(idx as u64);
+
+            Some(quote! { (#at, ::shipstern_core::Pubkey::new(#fixed)) })
+        })
+        .collect::<Vec<_>>();
+
+    // A program that dropped an IDL account shifts later ones a slot early. Refuse a fill if a
+    // fixed slot differs, another slot holds a fill address, or an earlier optional is missing.
+    let shifted_guard = fixed_keys
+        .iter()
+        .rposition(Option::is_some)
+        .map(|last_fixed| {
+            let optional_before = instruction
+                .accounts
+                .iter()
+                .take(last_fixed)
+                .enumerate()
+                .filter(|(_, account)| account.is_optional.unwrap_or(false))
+                .map(|(idx, _)| crate::utils::unsuffixed(idx as u64));
+
+            let last_fixed = crate::utils::unsuffixed(last_fixed as u64);
+
+            quote! {
+                if accounts.len() <= #last_fixed {
+                    let fixed: &[(usize, ::shipstern_core::Pubkey)] = &[#(#fixed_accounts),*];
+                    let optional: &[usize] = &[#(#optional_before),*];
+
+                    let shifted = optional.iter().any(|at| *at >= accounts.len())
+                        || fixed.iter().any(|(at, key)| match accounts.get(*at) {
+                            Some(carried) => carried != key,
+                            None => accounts.iter().enumerate().any(|(idx, carried)| {
+                                carried == key
+                                    && !fixed.iter().any(|(fixed_at, _)| *fixed_at == idx)
+                            }),
+                        });
+
+                    if shifted {
+                        // The same index the field reads report when nothing is filled.
+                        let mut missing = accounts.len();
+
+                        while optional.contains(&missing) {
+                            missing += 1;
+                        }
+
+                        return Err(ParseError::from(format!(
+                            "Account does not exist at index {missing}"
+                        )));
+                    }
+                }
+            }
+        });
 
     let has_explicit_remaining = instruction
         .accounts
@@ -498,6 +585,8 @@ fn single_instruction_helper_fn(
             accounts: &[::shipstern_core::Pubkey],
             data: &[u8],
         ) -> ParseResult<#wrapper_ident> {
+            #shifted_guard
+
             Ok(#wrapper_ident {
                 instruction: instruction::Instruction::#variant_ident {
                     accounts: #accounts_value,
